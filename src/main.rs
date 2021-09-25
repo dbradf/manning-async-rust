@@ -1,11 +1,13 @@
-use chrono::prelude::*;
+use async_std::fs::File;
 use async_std::prelude::*;
 use async_std::stream;
-use futures::future::join_all;
-use std::time::Duration;
 use async_trait::async_trait;
+use chrono::prelude::*;
 use clap::Clap;
+use futures::future::join_all;
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
+use xactor::*;
 use yahoo_finance_api as yahoo;
 
 #[derive(Clap)]
@@ -19,6 +21,8 @@ struct Opts {
     symbols: String,
     #[clap(short, long)]
     from: String,
+    #[clap(short, long, default_value = "stocks.csv")]
+    output_file: String,
 }
 
 ///
@@ -26,7 +30,6 @@ struct Opts {
 ///
 #[async_trait]
 trait AsyncStockSignal {
-
     ///
     /// The signal's data type.
     ///
@@ -140,7 +143,8 @@ async fn fetch_closing_data(
     let provider = yahoo::YahooConnector::new();
 
     let response = provider
-        .get_quote_history(symbol, *beginning, *end).await
+        .get_quote_history(symbol, *beginning, *end)
+        .await
         .map_err(|_| Error::from(ErrorKind::InvalidData))?;
     let mut quotes = response
         .quotes()
@@ -153,7 +157,9 @@ async fn fetch_closing_data(
     }
 }
 
+#[derive(Clone)]
 struct StockPeriod {
+    symbol: String,
     max: f64,
     min: f64,
     last_price: f64,
@@ -169,37 +175,56 @@ struct StockCalculator {
 }
 
 impl StockPeriod {
-    pub fn print_csv(&self, symbol: &str, from: &DateTime<Utc>) {
+    pub fn print_csv(&self, from: &DateTime<Utc>) {
         // a simple way to output CSV data
-        println!(
-            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+        print!("{}", self.format_csv(from));
+    }
+
+    pub fn format_csv(&self, from: &DateTime<Utc>) -> String {
+        // a simple way to output CSV data
+        format!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}\n",
             from.to_rfc3339(),
-            symbol,
+            self.symbol,
             self.last_price,
             self.pct_change * 100.0,
             self.min,
             self.max,
             self.sma.last().unwrap_or(&0.0)
-        );
+        )
     }
 }
 
 impl StockCalculator {
     pub fn new() -> Self {
         Self {
-            price_diff: PriceDifference{},
-            max_calc: MaxPrice{},
-            min_calc: MinPrice{},
-            sma_window: WindowedSMA {window_size: 30},
+            price_diff: PriceDifference {},
+            max_calc: MaxPrice {},
+            min_calc: MinPrice {},
+            sma_window: WindowedSMA { window_size: 30 },
         }
     }
 
-    async fn get_stock_data(&self, symbol: &str, from: &DateTime<Utc>, to: &DateTime<Utc>) -> std::io::Result<Option<StockPeriod>> {
+    async fn get_stock_data(
+        &self,
+        symbol: &str,
+        from: &DateTime<Utc>,
+        to: &DateTime<Utc>,
+    ) -> std::io::Result<Option<StockPeriod>> {
         let closes = fetch_closing_data(symbol, &from, &to).await?;
-        Ok(if !closes.is_empty() {
+        Ok(self.calc_data(symbol, closes).await)
+    }
+
+    async fn calc_data(&self, symbol: &str, closes: Vec<f64>) -> Option<StockPeriod> {
+        if !closes.is_empty() {
             // min/max of the period. unwrap() because those are Option types
-            let (_, pct_change) = self.price_diff.calculate(&closes).await.unwrap_or((0.0, 0.0));
+            let (_, pct_change) = self
+                .price_diff
+                .calculate(&closes)
+                .await
+                .unwrap_or((0.0, 0.0));
             Some(StockPeriod {
+                symbol: symbol.to_string(),
                 max: self.max_calc.calculate(&closes).await.unwrap(),
                 min: self.min_calc.calculate(&closes).await.unwrap(),
                 last_price: *closes.last().unwrap_or(&0.0),
@@ -208,29 +233,170 @@ impl StockCalculator {
             })
         } else {
             None
-        })
+        }
     }
 }
 
-#[async_std::main]
-async fn main() -> std::io::Result<()> {
+#[message(result = "()")]
+#[derive(Clone)]
+struct StockDownloadMessage {
+    symbol_list: Vec<String>,
+}
+
+struct StockDownloadActor {
+    from: DateTime<Utc>,
+}
+
+#[async_trait::async_trait]
+impl Actor for StockDownloadActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<StockDownloadMessage>().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StockDownloadMessage> for StockDownloadActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: StockDownloadMessage) {
+        let mut broker = Broker::from_registry().await.unwrap();
+        let symbol_list = msg.symbol_list;
+        let to = Utc::now();
+        let futures: Vec<_> = symbol_list
+            .iter()
+            .map(|s| fetch_closing_data(s, &self.from, &to))
+            .collect();
+        let closes_list: Vec<std::io::Result<Vec<f64>>> = join_all(futures).await;
+
+        for (symbol, data) in symbol_list.iter().zip(closes_list.iter()) {
+            if let Ok(data) = data {
+                broker.publish(StockProcessingMessage {
+                    symbol: symbol.clone(),
+                    closes: data.clone(),
+                });
+            }
+        }
+    }
+}
+
+#[message(result = "()")]
+#[derive(Clone)]
+struct StockProcessingMessage {
+    symbol: String,
+    closes: Vec<f64>,
+}
+
+struct StockProcessingActor {
+    from: DateTime<Utc>,
+    stock_calculator: StockCalculator,
+}
+
+#[async_trait::async_trait]
+impl Actor for StockProcessingActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<StockProcessingMessage>().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StockProcessingMessage> for StockProcessingActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: StockProcessingMessage) {
+        let closes = self
+            .stock_calculator
+            .calc_data(&msg.symbol, msg.closes)
+            .await;
+        if let Some(closes) = closes {
+            let stock_display_msg = StockDisplayMessage { closes };
+            Broker::from_registry()
+                .await
+                .unwrap()
+                .publish(stock_display_msg);
+        }
+    }
+}
+
+#[message(result = "()")]
+#[derive(Clone)]
+struct StockDisplayMessage {
+    closes: StockPeriod,
+}
+
+struct StockDisplayActor {
+    from: DateTime<Utc>,
+}
+
+#[async_trait::async_trait]
+impl Actor for StockDisplayActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<StockDisplayMessage>().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StockDisplayMessage> for StockDisplayActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: StockDisplayMessage) {
+        msg.closes.print_csv(&self.from);
+    }
+}
+
+struct StockFileSaveActor {
+    from: DateTime<Utc>,
+    file: File,
+}
+
+#[async_trait::async_trait]
+impl Actor for StockFileSaveActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<StockDisplayMessage>().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StockDisplayMessage> for StockFileSaveActor {
+    async fn handle(&mut self, ctx: &mut Context<Self>, msg: StockDisplayMessage) {
+        self.file
+            .write_all(msg.closes.format_csv(&self.from).as_bytes())
+            .await
+            .unwrap();
+        self.file.sync_all().await.unwrap();
+    }
+}
+
+#[xactor::main]
+async fn main() -> Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let symbol_list: Vec<&str> = opts.symbols.split(',').collect();
-    let stock_calculator = StockCalculator::new();
+    let mut file = File::create(opts.output_file).await?;
+    file.write_all(b"period start,symbol,price,change %,min,max,30d avg\n")
+        .await?;
+    let stock_downloader = StockDownloadActor { from: from.clone() }.start().await?;
+    let stock_processor = StockProcessingActor {
+        from: from.clone(),
+        stock_calculator: StockCalculator::new(),
+    }
+    .start()
+    .await?;
+    let stock_display = StockDisplayActor { from: from.clone() }.start().await?;
+    let stock_file_saver = StockFileSaveActor {
+        from: from.clone(),
+        file,
+    }
+    .start()
+    .await?;
+    let mut broker = Broker::from_registry().await?;
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
+    broker.publish(StockDownloadMessage {
+        symbol_list: symbol_list.iter().map(|s| s.to_string()).collect(),
+    });
     let mut interval = stream::interval(Duration::from_secs(30));
     while let Some(_) = interval.next().await {
-        let to = Utc::now();
-        let futures: Vec<_> = symbol_list.iter().map(|s| stock_calculator.get_stock_data(*s, &from, &to)).collect();
-        let closes_list: Vec<std::io::Result<Option<StockPeriod>>> = join_all(futures).await;
-
-        &symbol_list.iter().zip(closes_list.iter()).for_each(|(symbol, closes)| {
-            if let Ok(Some(stock_period)) = closes {
-                stock_period.print_csv(symbol, &from);
-            }
+        broker.publish(StockDownloadMessage {
+            symbol_list: symbol_list.iter().map(|s| s.to_string()).collect(),
         });
     }
     Ok(())
@@ -248,7 +414,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some((0.0, 0.0)));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some((-1.0, -1.0)));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some((8.0, 4.0))
         );
         assert_eq!(
@@ -264,7 +432,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some(1.0)
         );
         assert_eq!(
@@ -280,7 +450,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(1.0));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some(10.0)
         );
         assert_eq!(

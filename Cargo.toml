@@ -12,4 +12,5 @@ async-trait = "0.1.51"
 chrono = { version = "0.4", features = ["serde"] }
 clap = "3.0.0-beta.2"
 futures = "0.3"
+xactor = "0.7"
 yahoo_finance_api = { version = "1.1", features = [] }
