@@ -1,4 +1,8 @@
 use chrono::prelude::*;
+use async_std::prelude::*;
+use async_std::stream;
+use futures::future::join_all;
+use std::time::Duration;
 use async_trait::async_trait;
 use clap::Clap;
 use std::io::{Error, ErrorKind};
@@ -149,42 +153,85 @@ async fn fetch_closing_data(
     }
 }
 
+struct StockPeriod {
+    max: f64,
+    min: f64,
+    last_price: f64,
+    pct_change: f64,
+    sma: Vec<f64>,
+}
+
+struct StockCalculator {
+    price_diff: PriceDifference,
+    max_calc: MaxPrice,
+    min_calc: MinPrice,
+    sma_window: WindowedSMA,
+}
+
+impl StockPeriod {
+    pub fn print_csv(&self, symbol: &str, from: &DateTime<Utc>) {
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            from.to_rfc3339(),
+            symbol,
+            self.last_price,
+            self.pct_change * 100.0,
+            self.min,
+            self.max,
+            self.sma.last().unwrap_or(&0.0)
+        );
+    }
+}
+
+impl StockCalculator {
+    pub fn new() -> Self {
+        Self {
+            price_diff: PriceDifference{},
+            max_calc: MaxPrice{},
+            min_calc: MinPrice{},
+            sma_window: WindowedSMA {window_size: 30},
+        }
+    }
+
+    async fn get_stock_data(&self, symbol: &str, from: &DateTime<Utc>, to: &DateTime<Utc>) -> std::io::Result<Option<StockPeriod>> {
+        let closes = fetch_closing_data(symbol, &from, &to).await?;
+        Ok(if !closes.is_empty() {
+            // min/max of the period. unwrap() because those are Option types
+            let (_, pct_change) = self.price_diff.calculate(&closes).await.unwrap_or((0.0, 0.0));
+            Some(StockPeriod {
+                max: self.max_calc.calculate(&closes).await.unwrap(),
+                min: self.min_calc.calculate(&closes).await.unwrap(),
+                last_price: *closes.last().unwrap_or(&0.0),
+                pct_change,
+                sma: self.sma_window.calculate(&closes).await.unwrap_or_default(),
+            })
+        } else {
+            None
+        })
+    }
+}
+
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
-    let to = Utc::now();
-
-    let price_diff_calc = PriceDifference{};
-    let max_calc = MaxPrice{};
-    let min_calc = MinPrice{};
-    let sma_window_calc = WindowedSMA{ window_size: 30 };
+    let symbol_list: Vec<&str> = opts.symbols.split(',').collect();
+    let stock_calculator = StockCalculator::new();
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await?;
-        if !closes.is_empty() {
-                // min/max of the period. unwrap() because those are Option types
+    let mut interval = stream::interval(Duration::from_secs(30));
+    while let Some(_) = interval.next().await {
+        let to = Utc::now();
+        let futures: Vec<_> = symbol_list.iter().map(|s| stock_calculator.get_stock_data(*s, &from, &to)).collect();
+        let closes_list: Vec<std::io::Result<Option<StockPeriod>>> = join_all(futures).await;
 
-                let period_max: f64 = max_calc.calculate(&closes).await.unwrap();
-                let period_min: f64 = min_calc.calculate(&closes).await.unwrap();
-                let last_price = *closes.last().unwrap_or(&0.0);
-                let (_, pct_change) = price_diff_calc.calculate(&closes).await.unwrap_or((0.0, 0.0));
-                let sma = sma_window_calc.calculate(&closes).await.unwrap_or_default();
-
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
+        &symbol_list.iter().zip(closes_list.iter()).for_each(|(symbol, closes)| {
+            if let Ok(Some(stock_period)) = closes {
+                stock_period.print_csv(symbol, &from);
+            }
+        });
     }
     Ok(())
 }
